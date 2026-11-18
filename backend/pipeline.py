@@ -1,96 +1,197 @@
 """
-Prediction pipeline used by the API (runs on Laptop 1).
+PathSnap prediction pipeline.
 
-CONTRACT so teammates can plug in their parts:
-    predict_trip(trip_id) -> dict with
-        points   : list of [lat, lon]               raw GPS points
-        pred_arcs: list[int]                        predicted arc_id per GPS point
-        segments : list of [[lat,lon],[lat,lon]]    geometry of each predicted arc
-        arcs_table: ndarray (server-side only)      used by evaluate(), removed before returning
+Uses:
+  1. CandidateGenerator to find nearby road segments.
+  2. ViterbiDecoder to choose a likely connected sequence.
+  3. The .route file only during evaluation.
 
-CURRENT STATE: stand-in baseline = nearest road segment to each GPS point (uses NO labels).
-Replace `_nearest_arcs` with:
-    Person A -> candidate generation + features
-    Person B -> model.predict_proba
-    Person C -> viterbi_decode
-Ground truth (.route) is read only inside evaluate() and is never returned to the UI.
+IMPORTANT:
+The current .route file contains a trip-level route, not necessarily a
+GPS-point-aligned label sequence. Therefore `accuracy` below is route
+membership/coverage (fraction of predictions belonging to the reference
+route), NOT point-wise classification accuracy.
 """
 import os
 from pathlib import Path
+
 import numpy as np
 
+from map_matching.candidates import CandidateGenerator
+from map_matching.viterbi import viterbi_decode
+
 ROOT = Path(__file__).resolve().parent.parent
-# Dev: student_test. Final evaluation: set env var EVAL_DIR to the evaluator folder (no code change).
-EVAL_DIR = Path(os.environ.get("EVAL_DIR", ROOT / "data" / "Student folder" / "student_test"))
+EVAL_DIR = Path(
+    os.environ.get(
+        "EVAL_DIR",
+        ROOT / "data" / "Student folder" / "student_test",
+    )
+)
+
+# Keep these consistent with map_matching/hmm_config.yaml.
+HMM_CONFIG = {
+    "emission_weight": 1.0,
+    "transition_weight": 1.0,
+    "disconnected_penalty": 12.0,
+    "distance_scale": 100.0,
+    "max_candidates_per_point": 5,
+    "gap_threshold_seconds": 30.0,
+}
 
 
 def _trip_dir(trip_id: str) -> Path:
-    d = EVAL_DIR / trip_id
-    if not d.is_dir():
+    trip_dir = EVAL_DIR / trip_id
+    if not trip_dir.is_dir():
         raise FileNotFoundError(trip_id)
-    return d
+    return trip_dir
 
 
 def list_trips():
-    return sorted(p.name for p in EVAL_DIR.iterdir() if p.is_dir())
+    if not EVAL_DIR.is_dir():
+        raise FileNotFoundError(f"Evaluation directory not found: {EVAL_DIR}")
+    return sorted(path.name for path in EVAL_DIR.iterdir() if path.is_dir())
 
 
 def _load(trip_id):
-    d = _trip_dir(trip_id)
-    track = np.loadtxt(d / f"{trip_id}.track")            # lon, lat, timestamp
-    nodes = np.loadtxt(d / f"{trip_id}.nodes")            # lon, lat
-    arcs = np.loadtxt(d / f"{trip_id}.arcs", dtype=int)   # from_node, to_node
+    trip_dir = _trip_dir(trip_id)
+    track = np.atleast_2d(
+        np.loadtxt(trip_dir / f"{trip_id}.track", dtype=float)
+    )
+    nodes = np.atleast_2d(
+        np.loadtxt(trip_dir / f"{trip_id}.nodes", dtype=float)
+    )
+    arcs = np.atleast_2d(
+        np.loadtxt(trip_dir / f"{trip_id}.arcs", dtype=int)
+    )
+
+    if track.shape[1] < 3:
+        raise ValueError(f"{trip_id}.track must contain lon, lat, timestamp")
+    if nodes.shape[1] < 2 or arcs.shape[1] < 2:
+        raise ValueError("Invalid nodes/arcs file format")
+
     return track, nodes, arcs
 
 
-def _to_xy(lon, lat, lat0):
-    """Local metric projection (equirectangular), fine at city scale."""
-    R = 6371000.0
-    return np.radians(lon) * R * np.cos(np.radians(lat0)), np.radians(lat) * R
+def _build_prediction(track, nodes_array, arcs_array):
+    # Dataset IDs are row indices in the .nodes and .arcs files.
+    nodes = {
+        node_id: (float(row[0]), float(row[1]))
+        for node_id, row in enumerate(nodes_array)
+    }
+    arcs = {
+        arc_id: (int(row[0]), int(row[1]))
+        for arc_id, row in enumerate(arcs_array)
+    }
 
+    gps_points = [
+        (float(row[0]), float(row[1])) for row in track
+    ]
+    timestamps = [float(row[2]) for row in track]
 
-def _nearest_arcs(track, nodes, arcs):
-    lat0 = track[:, 1].mean()
-    px, py = _to_xy(track[:, 0], track[:, 1], lat0)
-    nx, ny = _to_xy(nodes[:, 0], nodes[:, 1], lat0)
-    ax, ay = nx[arcs[:, 0]], ny[arcs[:, 0]]
-    bx, by = nx[arcs[:, 1]], ny[arcs[:, 1]]
-    dx, dy = bx - ax, by - ay
-    L2 = np.maximum(dx * dx + dy * dy, 1e-9)
-    out = np.empty(len(px), dtype=int)
-    for i in range(len(px)):
-        t = np.clip(((px[i] - ax) * dx + (py[i] - ay) * dy) / L2, 0, 1)
-        d2 = (px[i] - (ax + t * dx)) ** 2 + (py[i] - (ay + t * dy)) ** 2
-        out[i] = int(np.argmin(d2))
-    return out
+    generator = CandidateGenerator(
+        nodes=nodes,
+        arcs=arcs,
+        max_candidates=int(HMM_CONFIG["max_candidates_per_point"]),
+        sigma=30.0,
+    )
+    candidates_per_point = generator.generate(gps_points)
+
+    predictions = viterbi_decode(
+        candidates_per_point=candidates_per_point,
+        arcs=arcs,
+        nodes=nodes,
+        gps_points=gps_points,
+        timestamps=timestamps,
+        config=HMM_CONFIG,
+    )
+
+    if len(predictions) != len(track):
+        raise RuntimeError(
+            f"Prediction count {len(predictions)} does not match "
+            f"GPS point count {len(track)}"
+        )
+
+    # Build the same output contract expected by backend.main and Streamlit.
+    segments = []
+    for arc_id in predictions:
+        if arc_id is None or arc_id not in arcs:
+            segments.append([])
+            continue
+        start_node, end_node = arcs[arc_id]
+        start_lon, start_lat = nodes[start_node]
+        end_lon, end_lat = nodes[end_node]
+        segments.append([
+            [float(start_lat), float(start_lon)],
+            [float(end_lat), float(end_lon)],
+        ])
+
+    return predictions, segments, arcs
 
 
 def predict_trip(trip_id: str) -> dict:
-    track, nodes, arcs = _load(trip_id)
-    pred = _nearest_arcs(track, nodes, arcs)               # <-- replace with the real pipeline
-    segments = [[[float(nodes[arcs[a, 0], 1]), float(nodes[arcs[a, 0], 0])],
-                 [float(nodes[arcs[a, 1], 1]), float(nodes[arcs[a, 1], 0])]] for a in pred]
+    track, nodes, arcs_array = _load(trip_id)
+    predictions, segments, _ = _build_prediction(track, nodes, arcs_array)
+
     return {
-        "points": [[float(la), float(lo)] for lo, la in track[:, :2]],
-        "pred_arcs": pred.tolist(),
+        "points": [
+            [float(row[1]), float(row[0])] for row in track
+        ],
+        "pred_arcs": predictions,
         "segments": segments,
-        "arcs_table": arcs,
+        "arcs_table": arcs_array,
     }
 
 
 def evaluate(trip_id: str, result: dict) -> dict:
-    """Server-side only: reads ground truth and computes metrics."""
-    d = _trip_dir(trip_id)
-    route = np.loadtxt(d / f"{trip_id}.route", dtype=int, ndmin=1)
-    truth = set(route.tolist())
-    pred, arcs = result["pred_arcs"], result["arcs_table"]
-    on_route = float(np.mean([a in truth for a in pred]))
-    connected = lambda a, b: a == b or len({arcs[a, 0], arcs[a, 1]} & {arcs[b, 0], arcs[b, 1]}) > 0
-    cont = sum(connected(a, b) for a, b in zip(pred, pred[1:])) / max(len(pred) - 1, 1)
+    """Evaluate predictions against the trip-level reference route."""
+    trip_dir = _trip_dir(trip_id)
+    route_path = trip_dir / f"{trip_id}.route"
+    route = np.atleast_1d(
+        np.loadtxt(route_path, dtype=int)
+    )
+    reference_arcs = set(int(arc_id) for arc_id in route.tolist())
+
+    predictions = result["pred_arcs"]
+    arcs_array = result["arcs_table"]
+
+    valid_predictions = [
+        int(arc_id) for arc_id in predictions
+        if arc_id is not None and 0 <= int(arc_id) < len(arcs_array)
+    ]
+
+    # This is route membership/coverage, not GPS-point-aligned accuracy.
+    route_coverage = (
+        sum(arc_id in reference_arcs for arc_id in valid_predictions)
+        / len(predictions)
+        if predictions else 0.0
+    )
+
+    direct_pairs = 0
+    connected_pairs = 0
+    for previous_id, current_id in zip(predictions, predictions[1:]):
+        if previous_id is None or current_id is None:
+            continue
+        if not (
+            0 <= int(previous_id) < len(arcs_array)
+            and 0 <= int(current_id) < len(arcs_array)
+        ):
+            continue
+        direct_pairs += 1
+        previous_end = int(arcs_array[int(previous_id), 1])
+        current_start = int(arcs_array[int(current_id), 0])
+        if previous_end == current_start:
+            connected_pairs += 1
+
+    continuity = (
+        connected_pairs / direct_pairs if direct_pairs else 0.0
+    )
+
     return {
-        "n_points": len(pred),
-        "accuracy": round(on_route, 4),          # placeholder definition, see README
-        "route_continuity": round(float(cont), 4),
-        "n_unique_predicted_arcs": len(set(pred)),
-        "n_reference_arcs": len(truth),
+        # Kept as a 0..1 field because backend.schemas and Streamlit expect it.
+        # It currently represents route coverage, not point-wise accuracy.
+        "accuracy": round(float(route_coverage), 4),
+        "route_continuity": round(float(continuity), 4),
+        "n_points": len(predictions),
+        "n_unique_predicted_arcs": len(set(valid_predictions)),
+        "n_reference_arcs": len(reference_arcs),
     }
