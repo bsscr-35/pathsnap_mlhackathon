@@ -1,0 +1,22 @@
+
+# PathSnap HMM Configuration
+# Person C - Viterbi Decoder
+
+emission_weight: 1.0
+
+transition_weight: 1.0
+
+disconnected_penalty: 12.0
+
+distance_scale: 100.0
+
+# Candidate generation settings
+max_candidates_per_point: 5
+
+# Distance-based fallback until Person B's classifier is ready
+use_distance_fallback: true
+
+# Evaluation settings
+compare_classifier_only: true
+compare_hmm_decoded: true
+gap_threshold_seconds: 30.0
