@@ -1,0 +1,26 @@
+{
+  "selected_model": "Tuned XGBoost",
+  "label_column": "Label",
+  "classes": [
+    0,
+    1
+  ],
+  "full_training_rows": 1944875,
+  "unique_trips": 80,
+  "sample_rows_for_model_comparison_and_tuning": 24000,
+  "validation": "GroupKFold with 5 folds grouped by Trip_ID",
+  "full_fit_seconds": 54.81918931007385,
+  "features": [
+    "distance_m",
+    "search_radius_m",
+    "gps_speed_mps",
+    "segment_length_m",
+    "heading_difference_deg",
+    "gps_heading_sin",
+    "gps_heading_cos",
+    "segment_heading_sin",
+    "segment_heading_cos",
+    "speed_quality"
+  ],
+  "warning": "Reported CV metrics are from the sampled dataset, not an independent test set."
+}
